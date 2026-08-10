@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use this code or dataset, please cite the manuscript and the two source papers."
+title: "Physics-informed machine learning prediction of fatigue crack growth in pre-corroded AA3003 friction stir welded joints"
+type: software
+authors:
+  - family-names: Chekalil
+    given-names: Ismail
+    affiliation: "King Fahd University of Petroleum & Minerals"
+  - family-names: Miloudi
+    given-names: Abdelkader
+    affiliation: "Laboratory of Materials and Reactive Systems (LMSR)"
+  - family-names: Nouioua
+    given-names: Mourad
+    affiliation: "King Fahd University of Petroleum & Minerals"
+  - family-names: Swaminathan
+    given-names: Vasanth
+    affiliation: "King Fahd University of Petroleum & Minerals"
+  - family-names: Belaribi
+    given-names: Amina
+    affiliation: "Laboratory of Materials and Reactive Systems (LMSR)"
+  - family-names: Khan
+    given-names: Sikandar
+    affiliation: "King Fahd University of Petroleum & Minerals"
+    email: sikandarkhan@kfupm.edu.sa
+year: 2026
+references:
+  - type: article
+    title: "Effect of corrosion environments on the mechanical properties of friction stir welded aluminum alloy AA3003"
+    journal: "Journal of Materials Research and Technology"
+    volume: 33
+    year: 2024
+    start: 2353
+    end: 2364
+    doi: 10.1016/j.jmrt.2024.09.167
+  - type: article
+    title: "Corrosion behavior of AA3003 friction stir welded joints"
+    journal: "Colloids and Surfaces A: Physicochemical and Engineering Aspects"
+    volume: 680
+    year: 2024
+    doi: 10.1016/j.colsurfa.2023.132673
