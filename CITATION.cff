@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this code or dataset, please cite the manuscript and the two source papers."
-title: "Physics-informed machine learning prediction of fatigue crack growth in pre-corroded AA3003 friction stir welded joints"
+title: "Uncertainty-aware modelling of fatigue crack growth in pre-corroded AA3003 friction stir welded joints"
 type: software
 authors:
   - family-names: Chekalil

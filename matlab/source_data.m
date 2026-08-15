@@ -28,8 +28,11 @@ S.fatigue.life_drop_55C_pct = 2.42;
 S.fatigue.life_drop_85C_pct = 61.64;
 
 % ---------------- Gravimetry [COLLOIDS] ------------------------------
-% Corrosion rate W (g.mm^-2.h^-1 as published) vs temperature, solution Y
-% (0.1 M HCl + 35 g/L NaCl). BM series read from Table 3.  VERIFY.
+% Corrosion rate W vs temperature, solution Y (0.1 M HCl + 35 g/L NaCl).
+% The published unit label (g.mm^-2.h^-1) is a misprint; a dimensional
+% audit of the printed mass losses (~0.004 g), specimen area
+% (30 x 27 x 1.8 mm, ~1.8e-3 m^2) and 3 h immersion gives g.m^-2.h^-1.
+% Only rate RATIOS enter the analysis, so Ea is unaffected.
 S.grav.T_C     = [25 45 65 85];
 S.grav.W_BM_Y  = [0.78882 2.26503 5.06672 9.07076];
 % FSW series in solution Y: only the 85 degC value is unambiguous in the

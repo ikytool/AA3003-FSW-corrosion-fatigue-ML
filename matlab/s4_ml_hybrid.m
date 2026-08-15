@@ -1,18 +1,27 @@
-%S4_ML_HYBRID Machine-learning layer on the digitized dataset.
-%   Data: pre-corroded conditions only (FSW.C from Figs 12+14 = two
-%   independent digitization passes, FSW.I from Fig 14).
-%   Target y = log10(da/dN in plotted units); features [log10 dK, T(K), inh].
+%S4_ML_HYBRID Machine-learning layer on the consolidated dataset.
+%   Data: the six pre-corroded conditions, ONE curve per physical test
+%   (FSW.C from Fig. 12, FSW.I from Fig. 14; the Fig. 14 replots of the
+%   FSW.C tests are excluded as duplicates of the same specimens).
+%   Target y = log10(da/dN, plotted units); features [log10 dK, T(K), inh],
+%   where T is the PRE-CORROSION CONDITIONING temperature (fatigue tests
+%   ran in air), never a crack-tip temperature.
 %
-%   Models: physics baseline (Arrhenius-Paris), multilinear regression,
-%   boosted trees, Gaussian process, hybrid (physics + GPR residual).
+%   Models: physics baseline (condition Paris fits + smooth T trend),
+%   multilinear regression, boosted trees (reference only), Gaussian
+%   process, hybrid (physics + GP residual).
 %
-%   Protocols:
-%     LOCO    - leave-one-curve-out (9 curves; group CV avoids leakage
-%               between the two digitization passes of the same test)
-%     LOTO-55 - train at 25 and 85 degC only, predict all 55 degC data
+%   Protocols (all elements refit inside each training fold, nothing
+%   from a held-out group enters baselines, scaling or calibration):
+%     LOCO     - leave-one-condition-out (6 folds)
+%     LOTO-T   - leave-one-temperature-out for T = 25, 55, 85 degC
+%                (55 is an interior hold-out; 25/85 are endpoint
+%                extrapolation folds)
+%   Interval inflation is NESTED: for each outer fold the factor comes
+%   from an inner leave-one-condition-out pass on the training set only.
 %
-%   Outputs: figures/fig_parity.pdf, figures/fig_loto.pdf,
-%            data/derived/model_metrics.csv
+%   Outputs: figures/fig_parity.pdf, fig_loto.pdf, fig_diagnostics.pdf,
+%            data/derived/model_metrics.csv, fold_contrasts.csv,
+%            feature_importance.csv
 
 clear; close all;
 fig_defaults();
@@ -23,9 +32,9 @@ datadir = fullfile(here, '..', 'data', 'digitized');
 dervdir = fullfile(here, '..', 'data', 'derived');
 if ~exist(dervdir, 'dir'), mkdir(dervdir); end
 
+% one curve per physical specimen (deduplicated)
 files = { ...
  'fig12_fswc_25c', 25, 0; 'fig12_fswc_55c', 55, 0; 'fig12_fswc_85c', 85, 0;
- 'fig14_fswc_25c', 25, 0; 'fig14_fswc_55c', 55, 0; 'fig14_fswc_85c', 85, 0;
  'fig14_fswi_25c', 25, 1; 'fig14_fswi_55c', 55, 1; 'fig14_fswi_85c', 85, 1};
 
 X = []; y = []; grp = [];
@@ -34,73 +43,92 @@ for k = 1:size(files, 1)
     n = height(T);
     X = [X; log10(T.dK), repmat(S.TK(files{k,2}), n, 1), repmat(files{k,3}, n, 1)]; %#ok<AGROW>
     y = [y; log10(T.dadN)]; %#ok<AGROW>
-    % group by CONDITION (T, inh): the fig12/fig14 duplicates of the
-    % same test must leave the training set together (no leakage)
     grp = [grp; repmat(files{k,2} * 10 + files{k,3}, n, 1)]; %#ok<AGROW>
 end
 n = numel(y);
-fprintf('Dataset: %d points, %d conditions\n', n, numel(unique(grp)));
+fprintf('Dataset: %d rate points from %d unique curves (6 conditions)\n', ...
+    n, size(files, 1));
 
 models = {'physics', 'mlr', 'gbt', 'gpr', 'hybrid'};
 rng(1);
 
-% ---------------- Protocol 1: leave-one-curve-out --------------------
+% ---------------- Protocol 1: leave-one-condition-out ----------------
 metrics = [];
 yhat_cv = nan(n, numel(models));
-pi_cv   = nan(n, 2, numel(models));   % 95% intervals where available
+pi_cv   = nan(n, 2, numel(models));
 for g = unique(grp)'
     te = grp == g; tr = ~te;
+    kc = nested_kcal(X(tr,:), y(tr), grp(tr));        % training-only factor
     for im = 1:numel(models)
         [yp, pint] = fit_predict(models{im}, X(tr,:), y(tr), X(te,:));
         yhat_cv(te, im) = yp;
-        if ~isempty(pint), pi_cv(te, :, im) = pint; end
+        if ~isempty(pint)
+            mid = mean(pint, 2); half = (pint(:,2) - pint(:,1)) / 2;
+            pi_cv(te, :, im) = [mid - kc*half, mid + kc*half];
+        end
     end
 end
 for im = 1:numel(models)
     metrics = [metrics; pack(models{im}, 'LOCO', y, yhat_cv(:,im), pi_cv(:,:,im))]; %#ok<AGROW>
 end
 
-% ---------------- Protocol 2: leave-one-temperature-out --------------
-T55 = abs(X(:,2) - S.TK(55)) < 1;
-yhat55 = nan(nnz(T55), numel(models));
-pi55   = nan(nnz(T55), 2, numel(models));
-for im = 1:numel(models)
-    [yp, pint] = fit_predict(models{im}, X(~T55,:), y(~T55), X(T55,:));
-    yhat55(:, im) = yp;
-    if ~isempty(pint), pi55(:, :, im) = pint; end
-    metrics = [metrics; pack(models{im}, 'LOTO-55C', y(T55), yp, pi55(:,:,im))]; %#ok<AGROW>
+% ---------------- Protocol 2: all leave-one-temperature-out folds ----
+foldT = [25 55 85];
+yhatT = cell(1, 3); piT = cell(1, 3); selT = cell(1, 3);
+for f = 1:3
+    sel = abs(X(:,2) - S.TK(foldT(f))) < 1;
+    selT{f} = sel;
+    tr = ~sel;
+    kc = nested_kcal(X(tr,:), y(tr), grp(tr));
+    yhatT{f} = nan(nnz(sel), numel(models));
+    piT{f}   = nan(nnz(sel), 2, numel(models));
+    for im = 1:numel(models)
+        [yp, pint] = fit_predict(models{im}, X(tr,:), y(tr), X(sel,:));
+        yhatT{f}(:, im) = yp;
+        if ~isempty(pint)
+            mid = mean(pint, 2); half = (pint(:,2) - pint(:,1)) / 2;
+            piT{f}(:, :, im) = [mid - kc*half, mid + kc*half];
+        end
+        metrics = [metrics; pack(models{im}, sprintf('LOTO-%dC', foldT(f)), ...
+            y(sel), yp, piT{f}(:,:,im))]; %#ok<AGROW>
+    end
 end
-
-% ---------------- Conformal calibration of the hybrid intervals ------
-% Inflate the hybrid's intervals by the 95th percentile of the
-% standardized cross-validation residuals (split-conformal idea): the
-% intervals then cover 95% in interpolation by construction, and the
-% honest report is the blind LOTO coverage with the SAME factor.
-ih = find(strcmp(models, 'hybrid'));
-sd_cv0 = (pi_cv(:,2,ih) - pi_cv(:,1,ih)) / (2 * 1.96);
-kcal = prctile(abs(y - yhat_cv(:,ih)) ./ sd_cv0, 95) / 1.96;
-fprintf('Conformal inflation factor (from LOCO residuals): k = %.2f\n', kcal);
-
-sd_550 = (pi55(:,2,ih) - pi55(:,1,ih)) / (2 * 1.96);
-cov55_cal = 100 * mean(abs(y(T55) - yhat55(:,ih)) <= 1.96 * kcal * sd_550);
-fprintf('Hybrid LOTO-55 coverage: %.1f%% raw -> %.1f%% conformal\n', ...
-    100 * mean(abs(y(T55) - yhat55(:,ih)) <= 1.96 * sd_550), cov55_cal);
-row = struct('model', 'hybrid_conformal', 'protocol', 'LOTO-55C', ...
-    'RMSE_log', metrics(strcmp({metrics.model}, 'hybrid') & ...
-    strcmp({metrics.protocol}, 'LOTO-55C')).RMSE_log, ...
-    'R2', metrics(strcmp({metrics.model}, 'hybrid') & ...
-    strcmp({metrics.protocol}, 'LOTO-55C')).R2, ...
-    'MAPE_pct', NaN, 'PICP95_pct', cov55_cal);
-metrics = [metrics; row];
 
 Tm = struct2table(metrics);
 writetable(Tm, fullfile(dervdir, 'model_metrics.csv'));
 disp(Tm);
 
+% ---------------- Fixed-dK contrasts per LOTO fold -------------------
+% At reference dK values: measured (per-curve Paris fit of the held-out
+% curve) versus predicted log rate, error in decades and as a
+% multiplicative factor, plus the inhibitor rate ratio.
+dKref = [5 8 12 15];
+ih = find(strcmp(models, 'hybrid'));
+crows = [];
+for f = 1:3
+    sel = selT{f};
+    for inh = 0:1
+        cs = sel & X(:,3) == inh;
+        pmeas = polyfit(X(cs,1), y(cs), 1);      % held-out curve's own fit
+        rng_dk = [min(10.^X(cs,1)), max(10.^X(cs,1))];
+        for dk = dKref
+            if dk < rng_dk(1) || dk > rng_dk(2), continue; end
+            % hybrid prediction at this dK (trained without this T)
+            Xq = [log10(dk), S.TK(foldT(f)), inh];
+            yq = fit_predict('hybrid', X(~sel,:), y(~sel), Xq);
+            ym = polyval(pmeas, log10(dk));
+            crows = [crows; {sprintf('LOTO-%dC', foldT(f)), inh, dk, ...
+                ym, yq, yq - ym, 10^(yq - ym)}]; %#ok<AGROW>
+        end
+    end
+end
+Tc = cell2table(crows, 'VariableNames', ...
+    {'fold','inhibited','dK','log_v_measured','log_v_predicted', ...
+     'err_decades','factor'});
+writetable(Tc, fullfile(dervdir, 'fold_contrasts.csv'));
+fprintf('Fixed-dK contrasts written (%d rows)\n', height(Tc));
+
 % ---------------- Permutation feature importance ---------------------
-% Within each LOCO fold: replace one feature of the held-out points by
-% random draws from the training marginal, measure the RMSE increase.
-% Done for the pure-ML model (gbt) and the hybrid.
 featnames = {'log10 dK', 'T', 'inhibitor'};
 imp = zeros(2, 3);
 rng(2);
@@ -119,19 +147,17 @@ for g = unique(grp)'
         end
     end
 end
-imp = sqrt(max(imp / numel(unique(grp)), 0));   % RMSE-increase scale
+imp = sqrt(max(imp / numel(unique(grp)), 0));
 Ti = array2table(imp, 'VariableNames', featnames, 'RowNames', {'gbt','hybrid'});
 writetable(Ti, fullfile(dervdir, 'feature_importance.csv'), 'WriteRowNames', true);
 fprintf('Permutation importance (RMSE increase, decades):\n'); disp(Ti);
 
 % ---------------- Statistical diagnostics figure ---------------------
 % (a) QQ plot of standardized LOCO residuals of the hybrid model
-% (b) prediction-interval calibration curve, LOCO and LOTO, with the
-%     conformally calibrated LOTO curve
-sd_cv = sd_cv0 * kcal;
+% (b) empirical coverage of the nested-calibrated hybrid bands, LOCO
+%     and the three temperature hold-out folds
+sd_cv = (pi_cv(:,2,ih) - pi_cv(:,1,ih)) / (2 * 1.96);
 z_cv  = (y - yhat_cv(:,ih)) ./ sd_cv;
-sd_55 = sd_550 * kcal;
-z_55  = (y(T55) - yhat55(:,ih)) ./ sd_55;
 
 fig = figure('Visible', 'off');
 tiledlayout(1, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
@@ -149,21 +175,29 @@ title('(a)', 'FontWeight', 'normal');
 
 nexttile; hold on;
 qs = 0.50:0.05:0.95;
-cov_cv = zeros(size(qs)); cov_55 = zeros(size(qs));
+plot([0.45 1], [0.45 1], 'k--', 'DisplayName', 'ideal');
+covq = zeros(size(qs));
 for iq = 1:numel(qs)
     zq = sqrt(2) * erfinv(qs(iq));
-    cov_cv(iq) = mean(abs(z_cv) <= zq);
-    cov_55(iq) = mean(abs(z_55) <= zq);
+    covq(iq) = mean(abs(z_cv) <= zq);
 end
-plot([0.45 1], [0.45 1], 'k--', 'DisplayName', 'ideal');
-plot(qs, cov_cv, '-o', 'MarkerFaceColor', 'auto', 'MarkerSize', 4, ...
-    'DisplayName', 'LOCO, calibrated');
-plot(qs, cov_55, '-s', 'MarkerFaceColor', 'auto', 'MarkerSize', 4, ...
-    'DisplayName', 'LOTO-55 (blind), calibrated');
+plot(qs, covq, '-o', 'MarkerFaceColor', 'auto', 'MarkerSize', 4, ...
+    'DisplayName', 'LOCO');
+mk = {'-s', '-^', '-d'};
+for f = 1:3
+    sdf = (piT{f}(:,2,ih) - piT{f}(:,1,ih)) / (2 * 1.96);
+    zf  = (y(selT{f}) - yhatT{f}(:,ih)) ./ sdf;
+    for iq = 1:numel(qs)
+        zq = sqrt(2) * erfinv(qs(iq));
+        covq(iq) = mean(abs(zf) <= zq);
+    end
+    plot(qs, covq, mk{f}, 'MarkerFaceColor', 'auto', 'MarkerSize', 4, ...
+        'DisplayName', sprintf('hold-out %d ^{\\circ}C', foldT(f)));
+end
 xlabel('nominal coverage');
 ylabel('empirical coverage');
-xlim([0.45 1]); ylim([0.3 1.02]);
-legend('Location', 'northwest');
+xlim([0.45 1]); ylim([0 1.02]);
+legend('Location', 'southeast');
 title('(b)', 'FontWeight', 'normal');
 
 export_vector(fig, 'fig_diagnostics', 180, 76);
@@ -172,8 +206,8 @@ export_vector(fig, 'fig_diagnostics', 180, 76);
 fig = figure('Visible', 'off');
 tiledlayout(2, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
 show = {'physics', 'mlr', 'gbt', 'hybrid'};
-ttl  = {'(a) physics (Arrhenius-Paris)', '(b) multilinear regression', ...
-        '(c) boosted trees', '(d) hybrid physics + GP'};
+ttl  = {'(a) physics (condition Paris + T trend)', '(b) multilinear regression', ...
+        '(c) boosted trees (reference)', '(d) hybrid physics + GP'};
 for i = 1:4
     im = find(strcmp(models, show{i}));
     nexttile; hold on;
@@ -189,39 +223,59 @@ for i = 1:4
 end
 export_vector(fig, 'fig_parity', 180, 168);
 
-% ---------------- Figure: LOTO blind prediction ----------------------
+% ---------------- Figure: the three temperature hold-out folds -------
 fig = figure('Visible', 'off');
-tiledlayout(1, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
-for panel = 1:2
-    inh = panel - 1;
-    nexttile; hold on;
-    sel = T55 & X(:,3) == inh;
-    hd = scatter(10.^X(sel,1), 10.^y(sel), 14, 'k', 'filled', ...
-        'MarkerFaceAlpha', 0.45, 'DisplayName', 'measured 55 ^{\circ}C (held out)');
-    dkq = logspace(log10(3.4), log10(15.5), 60)';
-    Xq = [log10(dkq), repmat(S.TK(55), 60, 1), repmat(inh, 60, 1)];
-    sty = {'-', '--', ':', '-.'};
-    cn = 0;
-    for nm = {'physics', 'gbt', 'hybrid'}
-        cn = cn + 1;
-        [yq, pint] = fit_predict(nm{1}, X(~T55,:), y(~T55), Xq);
-        plot(dkq, 10.^yq, sty{cn}, 'DisplayName', nm{1});
-        if strcmp(nm{1}, 'hybrid') && ~isempty(pint)
-            fill([dkq; flipud(dkq)], 10.^[pint(:,1); flipud(pint(:,2))], ...
-                [0 114 178]/255, 'FaceAlpha', 0.12, 'EdgeColor', 'none', ...
-                'DisplayName', 'hybrid 95% PI');
+tiledlayout(2, 3, 'Padding', 'compact', 'TileSpacing', 'compact');
+pl = 'abcdef'; ip = 0;
+for inh = 0:1
+    for f = 1:3
+        ip = ip + 1;
+        nexttile; hold on;
+        sel = selT{f} & X(:,3) == inh;
+        scatter(10.^X(sel,1), 10.^y(sel), 10, 'k', 'filled', ...
+            'MarkerFaceAlpha', 0.4, 'DisplayName', 'measured (held out)');
+        dkq = logspace(log10(3.4), log10(15.5), 60)';
+        Xq = [log10(dkq), repmat(S.TK(foldT(f)), 60, 1), repmat(inh, 60, 1)];
+        tr = ~selT{f};
+        cn = 0; sty = {'-', '--'};
+        for nm = {'physics', 'hybrid'}
+            cn = cn + 1;
+            [yq, pint] = fit_predict(nm{1}, X(tr,:), y(tr), Xq);
+            plot(dkq, 10.^yq, sty{cn}, 'DisplayName', nm{1});
+            if strcmp(nm{1}, 'hybrid') && ~isempty(pint)
+                fill([dkq; flipud(dkq)], 10.^[pint(:,1); flipud(pint(:,2))], ...
+                    [0 114 178]/255, 'FaceAlpha', 0.12, 'EdgeColor', 'none', ...
+                    'DisplayName', 'hybrid band');
+            end
         end
+        set(gca, 'XScale', 'log', 'YScale', 'log');
+        xlabel('\DeltaK (MPa\cdotm^{1/2})');
+        if f == 1, ylabel('da/dN (plotted units/cycle)'); end
+        nmst = 'FSW.C'; if inh, nmst = 'FSW.I'; end
+        title(sprintf('(%s) %s, hold-out %d ^{\\circ}C', pl(ip), nmst, ...
+            foldT(f)), 'FontWeight', 'normal');
+        if ip == 1, legend('Location', 'northwest', 'FontSize', 7); end
     end
-    set(gca, 'XScale', 'log', 'YScale', 'log');
-    xlabel('\DeltaK (MPa\cdotm^{1/2})');
-    ylabel('da/dN (plotted units/cycle)');
-    if inh == 0, title('(a) FSW.C, blind 55 ^{\circ}C', 'FontWeight', 'normal');
-    else,        title('(b) FSW.I, blind 55 ^{\circ}C', 'FontWeight', 'normal'); end
-    legend('Location', 'northwest');
 end
-export_vector(fig, 'fig_loto', 180, 81);
+export_vector(fig, 'fig_loto', 180, 120);
 
 % ======================================================================
+% Nested calibration: inner leave-one-condition-out on the TRAINING set
+% only; returns the 95th-percentile inflation of standardized hybrid
+% residuals. No held-out information enters this factor.
+function kc = nested_kcal(Xtr, ytr, grptr)
+    zs = [];
+    for g = unique(grptr)'
+        ite = grptr == g; itr = ~ite;
+        if nnz(itr) < 20, continue; end
+        [yp, pint] = fit_predict('hybrid', Xtr(itr,:), ytr(itr), Xtr(ite,:));
+        if isempty(pint), continue; end
+        sd = (pint(:,2) - pint(:,1)) / (2 * 1.96);
+        zs = [zs; abs(ytr(ite) - yp) ./ sd]; %#ok<AGROW>
+    end
+    if isempty(zs), kc = 1; else, kc = max(1, prctile(zs, 95) / 1.96); end
+end
+
 % All models are implemented in base MATLAB (no toolboxes):
 % OLS, gradient-boosted depth-2 trees, GP with ARD-RBF kernel whose
 % hyperparameters maximise the log marginal likelihood (fminsearch).
@@ -245,10 +299,8 @@ function [yp, pint] = fit_predict(model, Xtr, ytr, Xte)
             yb_te = physics_baseline(Xtr, ytr, Xte);
             [dr, ps] = gp_fit_predict(Xtr, ytr - yb_tr, Xte);
             yp = yb_te + dr;
-            % propagate the physics-baseline parameter uncertainty into
-            % the interval: stratified bootstrap of the training data
-            % (per condition), refit the baseline, add its variance to
-            % the GP predictive variance
+            % add the physics-baseline parameter variance (stratified
+            % bootstrap of the training data, refit per draw)
             B = 80;
             Yb = zeros(size(Xte, 1), B);
             key = Xtr(:,2) * 10 + Xtr(:,3);
@@ -357,8 +409,9 @@ function K = rbf(A, B, ell)
 end
 
 function yb = physics_baseline(Xtr, ytr, Xte)
-    % Arrhenius-Paris: per (T, inh) Paris fits on the training data,
-    % then ln C linear in 1/T and m linear in T within each family.
+    % Condition-wise Paris fits on the TRAINING data only, then
+    % ln C linear in 1/T and m linear in T within each inhibitor family.
+    % T is the pre-corrosion conditioning temperature.
     yb = zeros(size(Xte, 1), 1);
     for inh = 0:1
         Ts = unique(Xtr(Xtr(:,3) == inh, 2));
@@ -381,6 +434,7 @@ end
 function row = pack(model, protocol, y, yhat, pint)
     row.model = model; row.protocol = protocol;
     row.RMSE_log = sqrt(mean((y - yhat).^2));
+    row.factor = 10 ^ row.RMSE_log;      % multiplicative error factor
     row.R2 = 1 - sum((y - yhat).^2) / sum((y - mean(y)).^2);
     row.MAPE_pct = mean(abs(10.^yhat - 10.^y) ./ 10.^y) * 100;
     if ~isempty(pint) && ~all(isnan(pint(:)))
